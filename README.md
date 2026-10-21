@@ -437,6 +437,6 @@ local.properties
 
 ## Author
 
-**Md. Sazidur Rahman **: university project, *Privacy-Focused Messaging App*.
+**Md. Sazidur Rahman**: university project, *Privacy-Focused Messaging App*.
 
 Contributions, issues and suggestions are welcome.
