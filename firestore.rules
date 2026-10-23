@@ -1,0 +1,171 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function me() {
+      return request.auth.uid;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function chatDoc(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId));
+    }
+
+    // The chat ID must be made of the two UIDs joined by "_"
+    function validChatId(chatId, a, b) {
+      return chatId == a + '_' + b || chatId == b + '_' + a;
+    }
+
+    // A correct new chat request from the signed-in user
+    function validNewRequest(chatId) {
+      let data = request.resource.data;
+      return signedIn()
+        && data.keys().hasOnly([
+             'requesterId', 'recipientId', 'status',
+             'requestIv', 'requestCiphertext',
+             'kdfSalt', 'keyCheck',
+             'requesterPublicKey', 'recipientPublicKey',
+             'createdAt'])
+        && data.keys().hasAll([
+             'requesterId', 'recipientId', 'status',
+             'requestIv', 'requestCiphertext',
+             'kdfSalt', 'keyCheck',
+             'requesterPublicKey', 'recipientPublicKey',
+             'createdAt'])
+        && data.requesterId == me()
+        && data.recipientId is string
+        && data.recipientId != me()
+        && validChatId(chatId, me(), data.recipientId)
+        && data.status == 'pending'
+        && data.requestIv is string
+        && data.requestIv.size() <= 32
+        && data.requestCiphertext is string
+        && data.requestCiphertext.size() > 0
+        && data.requestCiphertext.size() <= 4000
+        && data.kdfSalt is string
+        && data.kdfSalt.size() <= 64
+        && data.keyCheck is string
+        && data.keyCheck.size() <= 64
+        // The saved public keys must match both users' real profiles
+        && data.requesterPublicKey == userDoc(me()).data.publicKey
+        && data.recipientPublicKey == userDoc(data.recipientId).data.publicKey
+        && data.createdAt == request.time;
+    }
+
+    // ---------- User profiles ----------
+    match /users/{userId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && me() == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.keys()
+          .hasOnly(['uid', 'email', 'createdAt', 'publicKey'])
+        && (!('publicKey' in request.resource.data)
+            || (request.resource.data.publicKey is string
+                && request.resource.data.publicKey.size() <= 300));
+
+      allow update: if signedIn()
+        && me() == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.keys()
+          .hasOnly(['uid', 'email', 'createdAt', 'publicKey'])
+        && (!('publicKey' in request.resource.data)
+            || (request.resource.data.publicKey is string
+                && request.resource.data.publicKey.size() <= 300))
+        // Once set, the public key can never change
+        && (!('publicKey' in resource.data)
+            || request.resource.data.publicKey == resource.data.publicKey);
+
+      allow delete: if false;
+
+      // Each user's key pair: only that user can read it, and it can't be replaced
+      match /private/{docId} {
+        allow read: if signedIn() && me() == userId;
+
+        allow create: if signedIn()
+          && me() == userId
+          && docId == 'identity'
+          && request.resource.data.keys()
+            .hasOnly(['publicKey', 'privateKey', 'createdAt'])
+          && request.resource.data.publicKey is string
+          && request.resource.data.privateKey is string
+          && request.resource.data.createdAt == request.time;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- Chats (request + accepted chat) ----------
+    match /chats/{chatId} {
+
+      // Open one chat: either participant
+      allow get: if signedIn() && me() in chatId.split('_');
+
+      // List chats: only ones the user is part of
+      allow list: if signedIn()
+        && (resource.data.requesterId == me()
+            || resource.data.recipientId == me());
+
+      // Send a request
+      allow create: if validNewRequest(chatId);
+
+      // Send a request over a leftover chat document from an older version of the app
+      // (it has no "status" field). The new request replaces it completely.
+      allow update: if signedIn()
+        && me() in chatId.split('_')
+        && !('status' in resource.data)
+        && validNewRequest(chatId);
+
+      // Accept: only the receiver, only from pending to accepted, nothing else changes
+      allow update: if signedIn()
+        && resource.data.recipientId == me()
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'accepted'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'acceptedAt'])
+        && request.resource.data.acceptedAt == request.time;
+
+      // Decline (receiver) or cancel (sender) a request that is still pending
+      allow delete: if signedIn()
+        && me() in [resource.data.requesterId, resource.data.recipientId]
+        && resource.data.status == 'pending';
+
+      // ---------- Messages ----------
+      match /messages/{messageId} {
+
+        allow read: if signedIn() && me() in chatId.split('_');
+
+        // Only encrypted messages, only in accepted chats
+        allow create: if signedIn()
+          && me() in chatId.split('_')
+          && chatDoc(chatId).data.status == 'accepted'
+          && request.resource.data.keys()
+               .hasOnly(['senderId', 'iv', 'ciphertext', 'createdAt'])
+          && request.resource.data.senderId == me()
+          && request.resource.data.iv is string
+          && request.resource.data.iv.size() <= 32
+          && request.resource.data.ciphertext is string
+          && request.resource.data.ciphertext.size() > 0
+          && request.resource.data.ciphertext.size() <= 20000
+          && request.resource.data.createdAt == request.time;
+
+        // Only old plain-text messages can be deleted, once the chat is accepted
+        allow delete: if signedIn()
+          && me() in chatId.split('_')
+          && ('text' in resource.data)
+          && chatDoc(chatId).data.status == 'accepted';
+
+        allow update: if false;
+      }
+    }
+  }
+}
